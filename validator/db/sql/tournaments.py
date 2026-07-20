@@ -8,6 +8,7 @@ from core.logging import get_logger
 from core.models.task_models import TaskType
 from core.models.trainer_contract_models import GPUInfo
 from validator.db.database import PSQLDB
+from validator.db.sql import gpu_costs
 from validator.db.sql import tasks as task_sql
 from validator.db.sql.submissions_and_scoring import get_all_scores_and_losses_for_task
 from validator.db.sql.submissions_and_scoring import get_task_winners
@@ -711,18 +712,26 @@ async def add_trainer_gpus(trainer_ip: str, gpu_infos: list[GPUInfo], psql_db: P
     """Add or update GPU information for a trainer"""
     async with await psql_db.connection() as connection:
         async with connection.transaction():
-            # First, remove existing entries for this trainer
+            await gpu_costs.reconcile_trainer_capacity(connection, trainer_ip, gpu_infos)
+
+            # Remove GPUs the trainer no longer reports. Keeping unchanged rows
+            # avoids turning every availability refresh into a capacity change.
             delete_query = f"""
                 DELETE FROM {cst.TRAINERS_GPUS_TABLE}
                 WHERE {cst.TRAINER_IP} = $1
+                  AND NOT ({cst.GPU_ID} = ANY($2::int[]))
             """
-            await connection.execute(delete_query, trainer_ip)
+            await connection.execute(delete_query, trainer_ip, [gpu.gpu_id for gpu in gpu_infos])
 
-            # Then insert new GPU information
             insert_query = f"""
                 INSERT INTO {cst.TRAINERS_GPUS_TABLE}
                 ({cst.TRAINER_IP}, {cst.GPU_ID}, {cst.GPU_TYPE}, {cst.VRAM_GB}, {cst.USED_UNTIL})
                 VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT ({cst.TRAINER_IP}, {cst.GPU_ID}) DO UPDATE SET
+                    {cst.GPU_TYPE} = EXCLUDED.{cst.GPU_TYPE},
+                    {cst.VRAM_GB} = EXCLUDED.{cst.VRAM_GB},
+                    {cst.USED_UNTIL} = EXCLUDED.{cst.USED_UNTIL},
+                    {cst.UPDATED_AT} = CURRENT_TIMESTAMP
             """
 
             for gpu_info in gpu_infos:
@@ -740,11 +749,13 @@ async def add_trainer_gpus(trainer_ip: str, gpu_infos: list[GPUInfo], psql_db: P
 async def remove_trainer(trainer_ip: str, psql_db: PSQLDB):
     """Remove a trainer and all its GPUs from the database"""
     async with await psql_db.connection() as connection:
-        query = f"""
-            DELETE FROM {cst.TRAINERS_GPUS_TABLE}
-            WHERE {cst.TRAINER_IP} = $1
-        """
-        await connection.execute(query, trainer_ip)
+        async with connection.transaction():
+            await gpu_costs.close_trainer_capacity(connection, trainer_ip)
+            query = f"""
+                DELETE FROM {cst.TRAINERS_GPUS_TABLE}
+                WHERE {cst.TRAINER_IP} = $1
+            """
+            await connection.execute(query, trainer_ip)
         logger.info(f"Removed trainer {trainer_ip} from the database")
 
 
