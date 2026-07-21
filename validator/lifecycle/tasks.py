@@ -17,11 +17,10 @@ from core.models.task_models import TaskType
 from validator.app.config import Config
 from validator.db.database import PSQLDB
 from validator.evaluation.basilica import EvaluationRetryableError
-from validator.evaluation.basilica_deployments import cleanup_all_basilica_deployments
-from validator.evaluation.reconcile import reconcile_eval_deployments
 from validator.evaluation.notifications import notify_evaluation_exception
 from validator.evaluation.notifications import task_deployment_ids_for_hotkeys
 from validator.evaluation.pvp.models import PvPIncompleteError
+from validator.evaluation.reconcile import reconcile_eval_deployments
 from validator.infrastructure.cache import clean_all_hf_datasets_cache
 from validator.infrastructure.cache import manage_models_cache
 from validator.scoring.constants import EMISSION_BURN_HOTKEY
@@ -319,7 +318,12 @@ async def _evaluate_and_update_hotkeys(task: AnyTypeRawTask, hotkeys: list[str],
         await tasks_sql.clear_task_evaluation_deployments(task.task_id, hotkeys, config.psql_db)
 
 
-async def _evaluate_pending_pairs_for_task(task: AnyTypeRawTask, num_gpus: int, config: Config):
+async def _evaluate_pending_pairs_for_task(
+    task: AnyTypeRawTask,
+    num_gpus: int,
+    config: Config,
+    active_evaluation_jobs: dict[tuple[str, str], asyncio.Task] | None = None,
+):
     assert task.task_id is not None
 
     batch_together = task.task_type == TaskType.GRPOTASK or should_use_tournament_eval(task)
@@ -344,11 +348,21 @@ async def _evaluate_pending_pairs_for_task(task: AnyTypeRawTask, num_gpus: int, 
     hotkey_batches = [all_hotkeys] if batch_together else [[hotkey] for hotkey in all_hotkeys]
     pending_evaluations = []
     for hotkeys in hotkey_batches:
+        job_key = (str(task.task_id), hotkeys[0])
+        if not batch_together and active_evaluation_jobs is not None and job_key in active_evaluation_jobs:
+            continue
+
         pending_batch = [hotkey for hotkey in hotkeys if hotkey in pending_hotkeys]
         if pending_batch:
             await tasks_sql.update_task_evaluations_status(task.task_id, pending_batch, "evaluating", config.psql_db)
 
-        pending_evaluations.append(_evaluate_and_update_hotkeys(task, hotkeys, num_gpus, config))
+        evaluation = _evaluate_and_update_hotkeys(task, hotkeys, num_gpus, config)
+        if not batch_together and active_evaluation_jobs is not None:
+            job = asyncio.create_task(evaluation)
+            active_evaluation_jobs[job_key] = job
+            job.add_done_callback(lambda _done, key=job_key: active_evaluation_jobs.pop(key, None))
+        else:
+            pending_evaluations.append(evaluation)
 
     if pending_evaluations:
         await asyncio.gather(*pending_evaluations)
@@ -359,13 +373,10 @@ async def _evaluate_pending_pairs_for_task(task: AnyTypeRawTask, num_gpus: int, 
 
 
 async def _cleanup_basilica_deployments_if_no_active_evaluations(config: Config) -> None:
-    active_evaluations = await tasks_sql.count_task_evaluations_by_status("evaluating", config.psql_db)
-    if active_evaluations:
-        logger.info("Skipping drained Basilica cleanup; %s evaluation rows still active", active_evaluations)
-        return
-
-    logger.info("No active evaluation rows remain; deleting all Basilica deployments")
-    await cleanup_all_basilica_deployments()
+    # Never infer account-wide ownership from one table/status. Pending work,
+    # PvP pairs, individual environment evals, and restart-resumed deployments
+    # all live outside evaluations.status='evaluating'. Reconcile explicit owners.
+    await reconcile_eval_deployments(config.psql_db)
 
 
 async def _move_back_to_looking_for_nodes(task: AnyTypeRawTask, config: Config):
@@ -491,6 +502,7 @@ async def _get_tasks_ready_for_evaluation(config: Config) -> list[RawTask]:
 
 async def evaluate_tasks_loop(config: Config):
     processing_task_ids: set[str] = set()
+    active_evaluation_jobs: dict[tuple[str, str], asyncio.Task] = {}
     last_reconcile_at = 0.0
 
     while True:
@@ -511,7 +523,14 @@ async def evaluate_tasks_loop(config: Config):
                 for task in evaluating_tasks:
                     if task.task_id not in processing_task_ids:
                         processing_task_ids.add(task.task_id)
-                        asyncio.create_task(_run_and_cleanup(task, processing_task_ids, config))
+                        asyncio.create_task(
+                            _run_and_cleanup(
+                                task,
+                                processing_task_ids,
+                                active_evaluation_jobs,
+                                config,
+                            )
+                        )
             else:
                 logger.info("No tasks ready for evaluation - waiting 30 seconds")
         except asyncio.CancelledError:
@@ -524,11 +543,17 @@ async def evaluate_tasks_loop(config: Config):
 async def _run_and_cleanup(
     task: RawTask,
     processing_task_ids: set[str],
+    active_evaluation_jobs: dict[tuple[str, str], asyncio.Task],
     config: Config,
 ):
     try:
         num_gpus = compute_required_gpus(task)
-        await _evaluate_pending_pairs_for_task(task, num_gpus, config)
+        await _evaluate_pending_pairs_for_task(
+            task,
+            num_gpus,
+            config,
+            active_evaluation_jobs,
+        )
     except Exception as e:
         logger.error(f"Error evaluating task {task.task_id}: {e}", exc_info=True)
     finally:
