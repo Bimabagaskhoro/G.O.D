@@ -73,7 +73,11 @@ class TestReplacementRouting:
     """Prep-failure replacement must preserve forced-model tasks: continuous-SFT recreates the
     same lineage (same carried base, chunk re-materialized), and the pre-boss task re-forces
     PRE_BOSS_MODEL with everything else fresh. Neither may fall through to
-    create_new_task_of_same_type, which draws a random model (and has no CHATTASK route at all)."""
+    create_new_task_of_same_type, which draws a random model (and has no CHATTASK route at all).
+
+    The pre-boss branch is additionally gated on NOT being the final round: PRE_BOSS_MODEL is a
+    public model the boss round's own pool can draw, so the model id alone no longer identifies
+    the pre-boss task."""
 
     def _patch_replace_seams(self, monkeypatch, original):
         monkeypatch.setattr(task_creator.task_sql, "get_task", AsyncMock(return_value=original))
@@ -131,6 +135,33 @@ class TestReplacementRouting:
         assert new_task_id == "new-task"
         assert instruct_mock.call_args.kwargs["model_id_override"] == t_cst.PRE_BOSS_MODEL
         assert instruct_mock.call_args.kwargs["allow_augmentation"] is False
+
+    async def test_final_round_task_on_the_pre_boss_model_is_not_treated_as_pre_boss(self, monkeypatch):
+        # PRE_BOSS_MODEL is a public model inside the boss round's own 12-71B pool, so a boss-round
+        # instruct task can legitimately carry it. Routing that through _create_pre_boss_task would
+        # pin the replacement to the model that just failed prep and drop augmentation/KL/YaRN on
+        # the title-deciding round, so the final round must fall through to a fresh random draw.
+        original = SimpleNamespace(
+            task_id="orig-task",
+            task_type=TaskType.INSTRUCTTEXTTASK,
+            training_start_point=TrainingStartPoint.DEFAULT,
+            ds="tatsu-lab/alpaca",
+            status=TaskStatus.PREP_TASK_FAILURE.value,
+            model_id=t_cst.PRE_BOSS_MODEL,
+            model_params_count=32_800_000_000,
+        )
+        same_type_mock = self._patch_replace_seams(monkeypatch, original)
+        same_type_mock.return_value = SimpleNamespace(task_id="redrawn-task", task_type=TaskType.INSTRUCTTEXTTASK)
+        instruct_mock = AsyncMock(return_value=SimpleNamespace(task_id="new-task", task_type=TaskType.INSTRUCTTEXTTASK))
+        monkeypatch.setattr(task_creator, "create_synthetic_instruct_text_task", instruct_mock)
+
+        new_task_id = await task_creator.replace_tournament_task(
+            "orig-task", "tourn", "round-4", None, "pair-1", MagicMock(), is_final_round=True
+        )
+
+        instruct_mock.assert_not_awaited()  # never re-forced through the pre-boss path
+        same_type_mock.assert_awaited_once()
+        assert new_task_id == "redrawn-task"
 
 
 class TestPreBossCompletionGate:

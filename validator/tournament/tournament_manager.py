@@ -1381,6 +1381,7 @@ async def is_tourn_task_completed(
             tournament_task.group_id,
             tournament_task.pair_id,
             config,
+            is_final_round=final_round,
         )
         return False, f"Task failed during preparation. Replaced with a new task {new_task_id}."
 

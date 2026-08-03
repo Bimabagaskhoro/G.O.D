@@ -860,7 +860,13 @@ async def _create_new_image_boss_round_tasks(tournament_id: str, round_id: str, 
 
 
 async def replace_tournament_task(
-    original_task_id: str, tournament_id: str, round_id: str, group_id: str | None, pair_id: str | None, config: Config
+    original_task_id: str,
+    tournament_id: str,
+    round_id: str,
+    group_id: str | None,
+    pair_id: str | None,
+    config: Config,
+    is_final_round: bool = False,
 ) -> str:
     logger.info(f"Starting task replacement for task {original_task_id}")
     logger.info(f"Tournament: {tournament_id}, Round: {round_id}, Group: {group_id}, Pair: {pair_id}")
@@ -890,7 +896,12 @@ async def replace_tournament_task(
                 )
             logger.info(f"Detected continuous-SFT task replacement; recreating lineage {lineage}")
             new_task = await create_continuous_sft_task(config, lineage, seed_model)
-        elif t_cst.is_pre_boss_task(original_task_obj):
+        elif not is_final_round and t_cst.is_pre_boss_task(original_task_obj):
+            # PRE_BOSS_MODEL is a public model that the boss round's own 12-71B pool can also draw,
+            # so the model id alone does not identify the pre-boss task — the round must not be the
+            # final one. Without this guard a boss-round instruct task that happened to draw
+            # PRE_BOSS_MODEL would be replaced by a copy pinned to the model that just failed prep,
+            # and silently stripped of augmentation/KL/YaRN on the round that decides the title.
             logger.info("Detected pre-boss task replacement; re-forcing the pre-boss model")
             new_task = await _create_pre_boss_task(config, _get_instruct_text_datasets(config.keypair))
         else:
